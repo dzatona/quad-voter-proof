@@ -1,0 +1,132 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bind Rust to recorded Lean artifacts
+        run: sha256sum -c reports/PROOF.sha256
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --manifest-path rust/Cargo.toml
+
+  lean:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      # This job needs more disk than `cose-parse-nopanic`'s equivalent job
+      # (same pins, same lakefile.lean shape): that crate's proof never
+      # references a Mathlib symbol Aeneas's own compiled library doesn't
+      # already re-export, so its `lean/` build never needs to fetch a
+      # separate Mathlib olean cache at all — `lean/.lake/packages/mathlib`
+      # stays source-only, 0 bytes built. This project's T3a/T3b proofs use
+      # real `Finset`/`Fintype` cardinality lemmas
+      # (`Finset.card_sdiff_add_card_eq_card`, `Fintype.card_fin`,
+      # `Finset.eq_of_subset_of_card_le`, ...), so `lean/`'s own build
+      # fetches and decompresses a full separate ≈6 GB Mathlib olean cache
+      # on top of the ≈7.5 GB the "Build Aeneas Lean lib" step below already
+      # uses for *its* copy — measured locally via `du -sh lean/.lake` on
+      # this machine. Combined, that is enough to exhaust a standard
+      # `ubuntu-latest` runner's default free disk, which is what actually
+      # failed run 35954821481 ("No space left on device", mid `lake
+      # build`) — reclaim space the runner doesn't need for this job before
+      # touching either Lean build.
+      - name: Free disk space (unused runner preinstalls)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
+          sudo docker image prune -a -f || true
+          df -h /
+      - name: Checkout Aeneas c2015b86
+        run: |
+          git clone --filter=blob:none --no-checkout https://github.com/AeneasVerif/aeneas.git aeneas
+          git -C aeneas fetch --depth 1 origin c2015b8668ba6d5b41f5f19d00a881c12bbb0b5d
+          git -C aeneas checkout FETCH_HEAD
+      - name: Install elan
+        run: |
+          curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf \
+            | sh -s -- -y --default-toolchain leanprover/lean4:v4.31.0
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+      - name: Build Aeneas Lean lib
+        working-directory: aeneas/backends/lean
+        run: |
+          lake exe cache get
+          lake build Aeneas
+          df -h /
+      - name: lake exe cache get (this project's own Mathlib olean cache)
+        # Explicit, not relied on implicitly: Mathlib's `lakefile.lean` has
+        # a `post_update` hook that fetches this cache automatically on
+        # dependency resolution, but running it as its own named step keeps
+        # "download a prebuilt cache" (network-bound) and "build our three
+        # targets" (CPU-bound) as separately diagnosable log sections, and
+        # guarantees the fast prebuilt-olean path runs before `lake build`
+        # instead of an implicit hook whose timing depends on resolution
+        # order.
+        env:
+          AENEAS_LEAN: ${{ github.workspace }}/aeneas/backends/lean
+        working-directory: lean
+        run: |
+          lake exe cache get
+          df -h /
+      - name: lake build VoterStatements
+        # `VoterStatements` transitively requires `VoterProof` requires
+        # `QuadVoterProof` (the other two `@[default_target]`s), so this
+        # builds the same dependency closure a bare `lake build` would —
+        # named explicitly so CI builds exactly the one target the axiom
+        # audit below imports, not "whatever this package's default targets
+        # happen to be" if that list ever grows.
+        env:
+          AENEAS_LEAN: ${{ github.workspace }}/aeneas/backends/lean
+        working-directory: lean
+        run: |
+          lake build VoterStatements
+          df -h /
+      - name: Axiom set (T1, T2, T3a, T3a_correct_never_disabled, T3a_nonempty, T3b, T4)
+        # Primary sorry/axiom gate: `#print axioms` reports every axiom each
+        # theorem transitively depends on, including `sorryAx` (what `sorry`
+        # compiles to) and any hand-written `axiom`. The allow-list below is
+        # exactly {propext, Classical.choice, Quot.sound}, so a `sorryAx` or
+        # a stray `axiom` anywhere in any of these seven theorems' (T1, T2,
+        # T3a and its two corollaries, T3b, T4) dependency graph shows up in
+        # `$out` and fails this step — not just a textual grep. The "No
+        # sorry / axiom" step below is a secondary, textual gate: it catches
+        # `sorry`/`axiom` in declarations no theorem happens to use.
+        env:
+          AENEAS_LEAN: ${{ github.workspace }}/aeneas/backends/lean
+        working-directory: lean
+        run: |
+          out=$(lake env lean --stdin <<'EOF'
+          import VoterStatements
+          open VoterStatements
+          #print axioms VoterStatements.T1
+          #print axioms VoterStatements.T2
+          #print axioms VoterStatements.T3a
+          #print axioms VoterStatements.T3a_correct_never_disabled
+          #print axioms VoterStatements.T3a_nonempty
+          #print axioms VoterStatements.T3b
+          #print axioms VoterStatements.T4
+          EOF
+          )
+          echo "$out"
+          for thm in T1 T2 T3a T3a_correct_never_disabled T3a_nonempty T3b T4; do
+            echo "$out" | grep -F "'VoterStatements.$thm' depends on axioms:"
+          done
+          extra=$(echo "$out" | grep "depends on axioms:" | sed 's/.*\[//;s/\].*//' | tr ',' '\n' | sed 's/^ *//;s/ *$//' | grep -v '^$' | grep -vx 'propext' | grep -vx 'Classical.choice' | grep -vx 'Quot.sound' || true)
+          if [ -n "$extra" ]; then
+            echo "unexpected axioms: $extra"
+            exit 1
+          fi
+      - name: No sorry / axiom in project files (secondary, textual gate)
+        # scripts/check-no-sorry.py strips Lean line (`--`) and nested block
+        # (`/- ... -/`) comments before matching `sorry`/`admit`/`axiom`, so
+        # `sorry -- TODO` cannot hide a real hit, and matches `axiom`
+        # anywhere on the line (not anchored at column 0), so `private
+        # axiom` / `@[simp] axiom` cannot hide one either. Its own
+        # `--self-test` (run here first) proves both of those against
+        # fixture strings before trusting it against the real files.
+        run: scripts/check-no-sorry.sh

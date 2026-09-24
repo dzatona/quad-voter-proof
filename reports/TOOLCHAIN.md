@@ -1,0 +1,82 @@
+# Toolchain
+
+Recorded 2026-09-23 on aarch64-apple-darwin. Pins match
+`cose-parse-nopanic/reports/TOOLCHAIN.md` (this crate's own layout template)
+exactly, since both repositories share the one Charon/Aeneas/Lean checkout on
+this machine.
+
+| Component | Pin | What ran here |
+|---|---|---|
+| Charon | commit `909ff09a`, v0.1.220 (`--preset=aeneas`) | `/Users/dzatona/charon` @ `909ff09ad0f144f83d354f2c3d26f631fb9f8e9a`, crate version `0.1.220` |
+| Charon rustc | nightly-2026-06-01 (Charon's `rust-toolchain`) | same |
+| Aeneas | commit `c2015b86` | `/Users/dzatona/aeneas` @ `c2015b86` (`Add bitwise operators on booleans. (#967)`); `charon-pin` matches `909ff09a` |
+| Lean / mathlib | v4.31.0 | `leanprover/lean4:v4.31.0` (elan); mathlib4 `v4.31.0` via Aeneas `lakefile.lean` |
+| rustc (crate tests) | stable, local `1.95.0` (`59807616e 2026-04-14`) | crate `rust-version = "1.92"` |
+
+No deviation from the `cose-parse-nopanic` pins was needed or recorded.
+
+## Install (this machine)
+
+Identical to `cose-parse-nopanic/reports/TOOLCHAIN.md`; both repositories
+use the one `~/charon` and `~/aeneas` checkout, so this is not reinstalled
+per repository.
+
+```sh
+# Charon
+git clone https://github.com/AeneasVerif/charon.git ~/charon
+cd ~/charon && git checkout 909ff09ad0f144f83d354f2c3d26f631fb9f8e9a
+rustup component add --toolchain nightly-2026-06-01-aarch64-apple-darwin rustfmt
+make build-charon-rust   # produces ~/charon/bin/charon
+
+# Aeneas (OCaml 5.3.0)
+brew install opam make pkgconf
+opam init -y --disable-sandboxing --compiler=5.3.0
+eval $(opam env --switch=5.3.0)
+opam install -y --confirm-level=unsafe-yes dune calendar core_unix domainslib \
+  easy_logging menhir ocamlformat.0.27.0 ocamlgraph odoc ppx_deriving \
+  ppx_deriving_yojson progress unionFind visitors yojson zarith
+ln -sfn ~/charon ~/aeneas/charon
+# after cloning Aeneas @ c2015b86:
+gmake -C ~/aeneas build   # GNU make; BSD make 3.81 is rejected
+
+# Lean
+brew install elan-init
+elan toolchain install leanprover/lean4:v4.31.0
+cd ~/aeneas/backends/lean && lake exe cache get && lake build Aeneas
+```
+
+`lean/lakefile.lean` loads Aeneas from `$HOME/aeneas/backends/lean`
+(`AENEAS_LEAN` overrides).
+
+## `scripts/check-extraction.sh` requirements
+
+Additionally needs `python3` on `PATH` (standard on macOS and on the Ubuntu
+CI image; used only to compare two LLBC JSON files while ignoring two fields
+that are not reproducible across Charon runs — see the comment in
+`scripts/check-extraction.sh` and `reports/EXTRACT.md` for what those two
+fields are and why ignoring them does not weaken the check).
+
+## Why `lean/lake-manifest.json` is not committed
+
+`.gitignore` excludes `/lean/lake-manifest.json` deliberately, not by
+oversight. `lean/lakefile.lean` depends on Aeneas as a `path`-type
+dependency (`require aeneas from aeneasLean`, resolved from `$AENEAS_LEAN`
+or `$HOME/aeneas/backends/lean`), and Lake's manifest records that
+dependency's resolved location as a literal absolute path — on this
+machine, `"dir": "/Users/dzatona/aeneas/backends/lean"`. Committing that
+file would either be wrong on every other machine (a stale absolute path
+that doesn't exist there) or, on CI, wrong in the opposite way (CI's own
+`lake build` regenerates the manifest pointing at `$GITHUB_WORKSPACE`,
+which would immediately diverge from whatever was committed, defeating
+the point of committing it). There is no portable, machine-independent
+form of this manifest as long as Aeneas is a local `path` dependency
+rather than a pinned `git` one.
+
+The authoritative pin is not the manifest; it is `AeneasVerif/aeneas` at
+commit `c2015b86`, recorded in this file's table above and pinned
+explicitly in `.github/workflows/ci.yml`'s "Checkout Aeneas c2015b86"
+step (`git fetch --depth 1 origin c2015b8668ba6d5b41f5f19d00a881c12bbb0b5d`
+then `git checkout FETCH_HEAD`) — not derived from any manifest, local or
+committed. `mathlib`/`plausible`/`batteries`/etc. are pinned transitively
+through Aeneas's own `lakefile.lean` at that commit, which *is* committed,
+in the Aeneas repository, not this one.
